@@ -57,3 +57,23 @@ test('renderer accepts Factorio empty Lua tables encoded as objects', () => {
   const image = renderMap({player:{position:{x:0,y:0}},tiles:{},entities:{}},1);
   assert.equal(image.readUInt32BE(16),24);
 });
+test('map view uses the bootstrap read-only observation action without mutating caller args', async () => {
+  let command='';
+  const h=new Harness({async command(value){command=value;return '{"ok":true,"id":"map-read","result":{}}';}});
+  const args={radius:128};
+  await h.request('map',args,'map-read');
+  assert.match(command,/"action":"observe"/);
+  assert.match(command,/"scope":"map"/);
+  assert.deepEqual(args,{radius:128});
+});
+test('nearest, craftable and power travel as read-only observe scopes', async () => {
+  const commands:string[]=[];
+  const h=new Harness({async command(value){commands.push(value);return `{"ok":true,"id":"read-${commands.length}","result":{}}`;}});
+  await h.request('nearest',{name:'iron-ore'},'read-1');
+  await h.request('craftable',{},'read-2');
+  await h.request('power',{radius:32},'read-3');
+  const [nearest, craftable, power] = commands as [string, string, string];
+  assert.match(nearest,/"action":"observe".*"scope":"nearest"/);
+  assert.match(craftable,/"action":"observe".*"scope":"craftable"/);
+  assert.match(power,/"action":"observe".*"scope":"power"/);
+});

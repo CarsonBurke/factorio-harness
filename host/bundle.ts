@@ -23,6 +23,6 @@ end
   const modules = await Promise.all(files.map(async file =>
     `factories[ ${luaString(file.slice(0,-4))} ] = function()\n${await readFile(join(folder,file),'utf8')}\nend\n`));
   const source = preamble + modules.join('') + await readFile(path,'utf8');
-  if (Buffer.byteLength(source) > 262144) throw new Error('Bundled runtime exceeds 256 KiB deployment limit');
+  if (Buffer.byteLength(source) > 524288) throw new Error('Bundled runtime exceeds 512 KiB deployment limit');
   return source;
 }

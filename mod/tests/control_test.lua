@@ -3,16 +3,23 @@
 package.path='mod/agent-harness_0.1.0/?.lua;'..package.path
 local assertions=0
 local function eq(a,b) assertions=assertions+1; assert(a==b,tostring(a)..' ~= '..tostring(b)) end
-storage={}; game={tick=7}; defines={events={on_tick=1}}
+log=function() end
+storage={}; game={tick=7}; defines={events={on_tick=1,on_script_path_request_finished=2,on_entity_died=3}}
 local encoded,sequence={},0
 helpers={table_to_json=function(value) sequence=sequence+1; local key='encoded-'..sequence; encoded[key]=value; return key end,json_to_table=function(key) return encoded[key] end}
 local events={}
-script={on_init=function(fn) events.init=fn end,on_load=function(fn) events.load=fn end,on_configuration_changed=function(fn) events.config=fn end,on_event=function(_,fn) events.tick=fn end}
+script={on_init=function(fn) events.init=fn end,on_load=function(fn) events.load=fn end,on_configuration_changed=function(fn) events.config=fn end,on_event=function(id,fn) if type(id)=='table' then events.forward=fn else events.tick=fn end end}
 local interface
 remote={add_interface=function(_,value) interface=value end}
 local calls,stops=0,0
 package.loaded.runtime={dispatch=function(r) calls=calls+1; if r.action=='fail' or r.args.fail then error('failure') end; return {calls=calls} end,tick=function() end,stop_all=function() stops=stops+1 end,stop_player=function() stops=stops+1 end}
 dofile('mod/agent-harness_0.1.0/control.lua'); events.init()
+-- Forwarded engine events reach runtime.on_event; a failure quarantines the runtime.
+local forwarded={}
+package.loaded.runtime.on_event=function(e) forwarded[#forwarded+1]=e.name; if e.fail then error('bad event') end end
+events.forward({name=2}); eq(forwarded[1],2)
+events.forward({name=3,fail=true}); eq(storage.agent_harness.runtime_fault.message:find('bad event')~=nil,true)
+storage.agent_harness.runtime_fault=nil
 local function request(id,action) return helpers.table_to_json{id=id,action=action,args={}} end
 local first=request('one','build'); local response=interface.dispatch(first)
 eq(encoded[response].ok,true); eq(interface.dispatch(first),response); eq(calls,1)

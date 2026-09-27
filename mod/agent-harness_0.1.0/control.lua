@@ -47,11 +47,26 @@ script.on_event(defines.events.on_tick, function(event)
     if not stopped then log('Agent harness cleanup error: '..tostring(stop_error)) end
   end
 end)
-local read_only = {describe = true, observe = true, inspect = true, status = true, recipes = true, technologies = true, queue_status = true, blueprint_export = true, blueprint_list = true}
+-- Engine callbacks the runtime may need beyond on_tick. Registration is fixed
+-- here so hot reloads keep identical handlers; the runtime opts in by exposing
+-- on_event. Faults quarantine the runtime exactly like tick failures.
+script.on_event({defines.events.on_script_path_request_finished, defines.events.on_entity_died,
+    defines.events.on_unit_group_finished_gathering, defines.events.on_entity_damaged}, function(event)
+  if state().runtime_fault then return end
+  if not runtime then boot() end
+  if not runtime.on_event then return end
+  local ok, err = pcall(runtime.on_event, event)
+  if not ok then
+    state().runtime_fault={tick=game.tick,message=tostring(err)}
+    pcall(runtime.stop_all)
+    log('Agent harness event error: ' .. tostring(err))
+  end
+end)
+local read_only = {describe = true, observe = true, inspect = true, status = true, recipes = true, technologies = true, queue_status = true, blueprint_export = true, blueprint_list = true, map = true, nearest = true, craftable = true, scan = true, power = true, grid = true, rates = true, bottleneck = true}
 remote.add_interface('agent_harness', {
   install = function(source)
     local ok,result=pcall(function()
-    assert(type(source) == 'string' and #source <= 262144, 'runtime source must be <=262144 bytes')
+    assert(type(source) == 'string' and #source <= 524288, 'runtime source must be <=524288 bytes')
     local candidate = compile(source) -- validate before changing the running runtime
     local stopped=true
     if runtime then stopped=pcall(runtime.stop_all) end

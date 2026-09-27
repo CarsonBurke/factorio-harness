@@ -30,10 +30,16 @@ export function parseReply(text: string): Reply {
   return parsed as Reply;
 }
 
+/** Read-only views the runtime serves through `observe`. */
+const OBSERVE_SCOPES = new Set(['map', 'nearest', 'craftable', 'scan', 'power', 'grid', 'rates', 'bottleneck', 'stock', 'platforms']);
+
 export class Harness {
   constructor(readonly transport: Transport, readonly player = 1, readonly journal?: string) {}
 
   async request(action: string, args: Record<string, unknown> = {}, id: string = randomUUID()): Promise<Reply> {
+    // Reuse the bootstrap's stable read-only operation. New observation views
+    // must not be treated as mutations by a bootstrap already loaded in-game.
+    if (OBSERVE_SCOPES.has(action)) { args = {...args, scope:action}; action = 'observe'; }
     const request = { id, action, player: this.player, args };
     const json = JSON.stringify(request);
     if (Buffer.byteLength(json) > 1048576) throw new Error('Request exceeds 1 MiB limit');

@@ -3,8 +3,12 @@
 -- The factory is pure so the same module can be bundled into a hot reload.
 return function(api)
   local H = {}
-  local MAX_ENTITIES, MAX_TILES, MAX_STRING, MAX_SLOTS = 512, 1024, 262144, 16
+  local MAX_ENTITIES, MAX_TILES, MAX_STRING, MAX_SLOTS = 4096, 8192, 1000000, 32
+  -- Factorio 2.0 remote view can place ghosts and order deconstruction on any
+  -- charted chunk; robots still have to fly there and use real items.
+  local MAX_AREA, MAX_AREA_ENTITIES = 256, 16384
   local directions = {north=0,east=4,south=8,west=12}
+  local real = api.real or function(p) return p end
 
   local function permission(p, action)
     local group = p.permission_group
@@ -93,20 +97,18 @@ return function(api)
   local function area(p, a)
     assert(type(a.area)=='table', 'area requires left_top and right_bottom')
     local lt, rb = api.position(a.area.left_top), api.position(a.area.right_bottom)
-    assert(lt.x<rb.x and lt.y<rb.y and rb.x-lt.x<=64 and rb.y-lt.y<=64, 'area must have positive dimensions at most 64 by 64')
-    for _, pos in ipairs({lt, rb, {x=lt.x,y=rb.y}, {x=rb.x,y=lt.y}}) do
-      assert(api.visible(p,pos), 'area is outside local visible range')
-    end
+    assert(lt.x<rb.x and lt.y<rb.y and rb.x-lt.x<=MAX_AREA and rb.y-lt.y<=MAX_AREA, 'area must have positive dimensions at most '..MAX_AREA..' by '..MAX_AREA)
     for x=math.floor(lt.x/32),math.floor(rb.x/32) do
       for y=math.floor(lt.y/32),math.floor(rb.y/32) do
-        assert(p.force.is_chunk_visible(p.surface,{x=x,y=y}), 'area includes hidden chunks')
+        assert((api.own_platform and api.own_platform(p)) or p.force.is_chunk_charted(p.surface,{x=x,y=y}), 'area includes uncharted chunks')
       end
     end
     return {left_top=lt,right_bottom=rb}
   end
+  -- Resource tiles are never selected by planners, so they must not consume the budget.
   local function candidates(p, box)
-    local list = p.surface.find_entities_filtered{area=box, limit=MAX_ENTITIES+1}
-    assert(#list<=MAX_ENTITIES, 'area entity limit exceeded; select a smaller area')
+    local list = p.surface.find_entities_filtered{area=box, type='resource', invert=true, limit=MAX_AREA_ENTITIES+1}
+    assert(#list<=MAX_AREA_ENTITIES, 'area entity limit exceeded; select a smaller area')
     return list
   end
   local function summary(stack, name)
@@ -150,7 +152,7 @@ return function(api)
         result.marked=0
         -- Cut only the entities captured, never unrelated trees/resources.
         for _, e in pairs(mapping) do
-          if e.valid and e.force==p.force and e.order_deconstruction(p.force,p) then result.marked=result.marked+1 end
+          if e.valid and e.force==p.force and e.order_deconstruction(p.force,real(p)) then result.marked=result.marked+1 end
         end
         result.tiles_marked=false -- Entity cut only: tile removal is not exposed.
       end
@@ -216,8 +218,8 @@ return function(api)
         local snapping_disabled=stack.blueprint_snap_to_grid~=nil
         stack.blueprint_snap_to_grid=nil
         local entities, tiles=validate(stack)
-        -- Conservatively validate a square containing every possible rotated
-        -- footprint. This prevents edge entities or rotation exposing hidden land.
+        -- Validate a square containing every possible rotated or flipped
+        -- footprint: quarter turns and flips keep max(|x|,|y|) invariant.
         local radius=1
         for _, e in ipairs(entities) do
           local proto=prototypes.entity[e.name]
@@ -227,9 +229,9 @@ return function(api)
           for _, corner in ipairs({box.left_top,box.right_bottom}) do
             margin=math.max(margin,math.abs(corner.x),math.abs(corner.y))
           end
-          radius=math.max(radius, math.abs(e.position.x)+math.abs(e.position.y)+margin+1)
+          radius=math.max(radius, math.max(math.abs(e.position.x),math.abs(e.position.y))+margin+1)
         end
-        for _, tile in ipairs(tiles) do radius=math.max(radius,math.abs(tile.position.x)+math.abs(tile.position.y)+2) end
+        for _, tile in ipairs(tiles) do radius=math.max(radius,math.max(math.abs(tile.position.x),math.abs(tile.position.y))+2) end
         local box=area(p,{area={left_top={x=pos.x-radius,y=pos.y-radius},right_bottom={x=pos.x+radius,y=pos.y+radius}}})
         local function ghosts()
           return p.surface.find_entities_filtered{area=box,type={'entity-ghost','tile-ghost'},force=p.force}
@@ -239,6 +241,13 @@ return function(api)
         end
         local before={}
         for _,e in pairs(ghosts()) do before[ghost_key(e)]=true end
+        if type(p)=='table' and rawget(p,'__platform') then
+          -- A platform is built from remote view: place the blueprint's ghosts
+          -- on its surface directly; the cursor lives on the player's surface.
+          assert(not a.flip_horizontal and not a.flip_vertical, 'flips are not supported when pasting on a platform')
+          stack.build_blueprint{surface=p.surface,force=p.force,position=pos,direction=direction,
+            build_mode=defines.build_mode.normal,skip_fog_of_war=true,by_player=real(p),raise_built=true}
+        else
         assert(p.cursor_stack and not p.cursor_stack.valid_for_read, 'cursor must be empty; put held items away before pasting')
         local cursor_ghost=p.cursor_ghost
         assert(p.cursor_stack.swap_stack(stack), 'could not borrow cursor for blueprint')
@@ -252,12 +261,33 @@ return function(api)
         -- a physical player item when temporary metadata is cleaned up.
         assert(restored, 'could not restore cursor after blueprint placement')
         assert(ok,err)
-        local out={ghosts={},count=0,slot=slot_name(a),snapping_disabled=snapping_disabled}
+        end
+        -- Per-ghost rows are opt-in: large layouts otherwise flood agent context.
+        local out={count=0,by_name={},slot=slot_name(a),snapping_disabled=snapping_disabled}
+        if a.details then out.ghosts={} end
         for _, e in pairs(ghosts()) do
           if e.valid and not before[ghost_key(e)] then
             out.count=out.count+1
-            out.ghosts[#out.ghosts+1]={name=e.ghost_name,position=e.position,unit_number=e.unit_number,type=e.type}
+            out.by_name[e.ghost_name]=(out.by_name[e.ghost_name] or 0)+1
+            local x,y=e.position.x,e.position.y
+            if out.bounds then
+              local b=out.bounds
+              b.left=math.min(b.left,x); b.top=math.min(b.top,y); b.right=math.max(b.right,x); b.bottom=math.max(b.bottom,y)
+            else out.bounds={left=x,top=y,right=x,bottom=y} end
+            if a.details then out.ghosts[#out.ghosts+1]={name=e.ghost_name,position=e.position,unit_number=e.unit_number,type=e.type} end
           end
+        end
+        -- Explain a short paste: the engine silently skips positions that
+        -- already hold a matching ghost or entity, or that collide.
+        if out.count<#entities then
+          local names={}
+          for _,e in ipairs(entities) do names[e.name]=true end
+          local ghosts_there,built_there=0,0
+          for _,e in pairs(ghosts()) do if e.valid and before[ghost_key(e)] and names[e.ghost_name] then ghosts_there=ghosts_there+1 end end
+          for _,e in pairs(p.surface.find_entities_filtered{area=box,force=p.force}) do if e.valid and names[e.name] then built_there=built_there+1 end end
+          out.expected=#entities; out.existing_ghosts=ghosts_there; out.existing_entities=built_there
+          out.reason=(ghosts_there>0 or built_there>0) and 'matching ghosts or entities already occupy the area (pasted or built before?)'
+            or 'placements collided with other entities or terrain'
         end
         return out
       end)
@@ -282,8 +312,8 @@ return function(api)
         and (not filters.entity_types or filters.entity_types[e.type])
         and (not filters.entity_names or filters.entity_names[e.name]) then
         if cancel then
-          if e.to_be_deconstructed(p.force) then e.cancel_deconstruction(p.force,p); changed=changed+1 end
-        elseif e.order_deconstruction(p.force,p) then changed=changed+1 end
+          if e.to_be_deconstructed(p.force) then e.cancel_deconstruction(p.force,real(p)); changed=changed+1 end
+        elseif e.order_deconstruction(p.force,real(p)) then changed=changed+1 end
       end
     end
     return {changed=changed,mode=cancel and 'cancel' or 'mark',tiles=false}

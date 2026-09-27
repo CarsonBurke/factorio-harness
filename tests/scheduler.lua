@@ -1,4 +1,5 @@
 local factory=dofile('mod/agent-harness_0.1.0/scheduler.lua')
+local world={}
 game={tick=0}
 local state,active,combat,calls={},{},{},{}
 local players={[1]={index=1}}
@@ -15,6 +16,8 @@ local scheduler=factory{
   handlers=handlers,
   busy=function(p,action) return action=='shoot' and combat[p.index]~=nil or action=='walk' and active[p.index]~=nil end,
   stop=stop,stop_index=function(i) active[i]=nil;combat[i]=nil end,
+  condition=function(_,c) return world[c['until']]==true,'saw '..c['until'] end,
+  validate_condition=function(c) assert(type(c)=='table' and c['until'],'until must be one of') end,
 }
 local h=scheduler.handlers
 local p=players[1]
@@ -41,7 +44,9 @@ check(h.queue_status(p).active.action=='wait_ticks')
 q=h.queue_edit(p,{expected_revision=revision,index=1,remove=1,steps={{action='walk'}}})
 check(#q.pending==1 and q.pending[1].action=='walk')
 q=h.queue_cancel(p,{clear=false})
+-- A relative step (wait N ticks) is not requeued: it would repeat itself.
 check(q.paused and not q.active and #q.pending==1)
+check(not q.history[#q.history].result.requeued)
 check(not active[1] and not combat[1])
 tick(); check(not active[1])
 h.queue_resume(p,{}); tick(); check(active[1]~=nil)
@@ -81,6 +86,13 @@ h.queue_cancel(p,{clear=false})
 for _=1,70 do tick() end
 check(#calls==before+2 and h.queue_status(p).repeating)
 h.queue_resume(p,{}); tick(); check(#calls==before+3)
+-- A runtime replacement leaves a loop resting between cycles scheduled,
+-- but pauses one with work under way.
+tick(); check(not h.queue_status(p).paused)
+scheduler.pause_all(); check(not h.queue_status(p).paused)
+h.queue_submit(p,{steps={{action='walk',args={ticks=30}}}}); tick()
+scheduler.pause_all(); check(h.queue_status(p).paused)
+h.queue_resume(p,{})
 h.queue_cancel(p,{})
 check(not h.queue_status(p).repeating)
 h.queue_repeat(p,{steps={{action='broken'},{action='craft'}},interval_ticks=60})
@@ -90,4 +102,38 @@ for _=1,70 do tick() end
 check(#calls==before)
 h.queue_submit(p,{mode='replace',steps={}})
 check(not h.queue_status(p).repeating)
+-- wait_until finishes when its condition holds and fails on timeout.
+h.queue_cancel(p,{}); calls={}
+h.queue_submit(p,{steps={{action='wait_until',args={['until']='clear',timeout=50}},{action='craft'}}})
+tick(); tick(); check(h.queue_status(p).waiting.condition['until']=='clear'); check(#calls==0)
+world.clear=true; for _=1,10 do tick() end
+check(calls[1]=='craft'); check(h.queue_status(p).history[#h.queue_status(p).history-1].result.outcome=='met')
+world.clear=false
+h.queue_submit(p,{steps={{action='wait_until',args={['until']='clear',timeout=20}},{action='craft'}}})
+for _=1,40 do tick() end
+q=h.queue_status(p); check(q.paused); check(q.last_failure.result.outcome=='timed_out'); check(#q.pending==1)
+check(not pcall(h.queue_submit,p,{steps={{action='wait_until',args={}}}}))
+check(not pcall(h.queue_submit,p,{steps={{action='craft',on_fail='retry'}}}))
+-- on_fail: skip continues, goto drops pending steps up to the label.
+h.queue_cancel(p,{}); calls={}
+h.queue_submit(p,{steps={{action='broken',on_fail='skip'},{action='craft'}}})
+tick(); check(calls[1]=='craft'); check(not h.queue_status(p).paused)
+calls={}
+h.queue_submit(p,{steps={{action='broken',on_fail='goto:out'},{action='walk'},{action='craft',label='out'}}})
+tick(); check(calls[1]=='craft' and #calls==1)
+h.queue_submit(p,{steps={{action='broken',on_fail='goto:nowhere'},{action='craft'}}})
+tick(); q=h.queue_status(p); check(q.paused); check(q.last_failure.result.goto_error~=nil)
+-- A guard interrupts the running step once and runs its reaction.
+h.queue_cancel(p,{}); calls={}; world.hurt=false
+h.queue_submit(p,{guards={{when={['until']='hurt'},steps={{action='craft'}}}},
+  steps={{action='walk',args={ticks=500}},{action='walk',args={ticks=5}}}})
+tick(); check(active[1]~=nil)
+world.hurt=true
+for _=1,12 do tick() end
+q=h.queue_status(p)
+check(calls[#calls]=='craft'); check(#q.pending==0); check(q.guards==nil)
+local fired=false
+for _,entry in ipairs(q.history) do if entry.action=='guard' then fired=true end end
+check(fired)
+check(not pcall(h.queue_submit,p,{guards={{when={['until']='hurt'},['goto']='a',steps={}}},steps={}}))
 print('scheduler: '..assertions..' assertions passed')

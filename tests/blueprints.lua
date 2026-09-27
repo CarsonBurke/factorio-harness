@@ -40,7 +40,7 @@ game={create_inventory=function()
 end}
 prototypes={entity={chest={selection_box={left_top={x=-0.5,y=-0.5},right_bottom={x=0.5,y=0.5}}}}}
 local p={index=1,position={x=0,y=0},cursor_stack=stack()}
-p.force={name='player',is_chunk_visible=function()return true end}
+p.force={name='player',is_chunk_charted=function(_,c)return not (c.x==1 and c.y==1) end}
 p.surface={find_entities_filtered=function()return {} end}
 p.build_from_cursor=function(args)built=built+1; p.last_build=args end
 local H=dofile('mod/agent-harness_0.1.0/blueprints.lua'){
@@ -53,7 +53,7 @@ local function fails(fn,pattern)
 end
 
 -- Invalid/hidden requests must fail before snapshotting any world state.
-fails(function()H.copy(p,{area={left_top={x=40,y=40},right_bottom={x=42,y=42}}})end,'visible')
+fails(function()H.copy(p,{area={left_top={x=40,y=40},right_bottom={x=42,y=42}}})end,'uncharted')
 assert(captured==0)
 p.permission_group={allows_action=function()return false end}
 fails(function()H.copy(p,{area=box})end,'permission')
@@ -83,6 +83,7 @@ p.cursor_stack._data={}
 local paste=H.paste(p,{position={x=4,y=0},direction='east',flip_horizontal=true})
 assert(built==1 and p.last_build.direction==4 and p.last_build.flip_horizontal)
 assert(not p.cursor_stack.valid_for_read and paste.count==0)
+assert(paste.expected==1 and paste.reason, 'a short paste explains itself')
 p.build_from_cursor=function()error('blocked callback')end
 fails(function()H.paste(p,{position={x=4,y=0}})end,'blocked callback')
 assert(not p.cursor_stack.valid_for_read)
