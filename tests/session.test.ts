@@ -33,3 +33,7 @@ test('invalid session operations reject before touching processes or paths', asy
   await assert.rejects(startSession({name:'../escape'}), /slug/);
   await assert.rejects(stopSession('../escape'), /slug/);
 });
+test('conflicting launch modes reject before looking for Factorio', async () => {
+  await assert.rejects(startSession({name:'conflict', headless:true, niri:true}), /--niri/);
+  await assert.rejects(startSession({name:'conflict', headless:true, bridge:true}), /--bridge/);
+});

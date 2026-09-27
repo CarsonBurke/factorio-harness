@@ -71,7 +71,7 @@ Without `FACTORIO_CLIENT_BIN`, gameplay checks are explicitly skipped. Headless 
 
 ## Graphical session launcher
 
-The default launcher was separately exercised with Factorio 2.0.77 under an
+The launcher's `--niri` mode was separately exercised with Factorio 2.0.77 under an
 isolated nested Niri compositor. The existing desktop Factorio window's focused
 window ID and focus timestamp were identical before launch, after graphical
 readiness, and after shutdown. No host focus restoration or input commands were

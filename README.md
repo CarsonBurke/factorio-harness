@@ -15,14 +15,14 @@ fh stop-session              # save and quit
 
 ## Install
 
-You need Node.js 20+, Factorio 2.0 (Space Age optional), and, for `fh start`, the [Niri](https://github.com/YaLTeR/niri) compositor with `niri-harness`.
+You need Node.js 20+ and Factorio 2.0 (Space Age optional), on Linux.
 
 ```sh
 npm ci && npm run build
 npm link        # puts `fh` on your PATH
 ```
 
-Not on Niri? See [running your own server](docs/usage.md#your-own-server).
+To use a server you already run, see [your own server](docs/usage.md#your-own-server).
 
 ## Usage
 

@@ -18,11 +18,12 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const modPath = resolve(root, 'mod/agent-harness_0.1.0');
 const help = `fh — Factorio agent CLI
 
-  fh start [--name default] [--space-age]     Start graphical game without taking Niri focus
+  fh start [--name default] [--space-age]     Start a private server and a graphical client
+       [--save world.zip] [--niri]           --niri: client in an unfocused nested Niri window (default: FH_NIRI=1)
   fh start --headless                        Start only the private server
   fh start --bridge                          Vanilla private server played through the client bridge
   fh connect --server HOST:PORT [--name mp]  Join someone else's server with a bridged client
-       [--password-file F] [--player-data player-data.json] [--mods DIR] [--space-age]
+       [--password-file F] [--player-data player-data.json] [--mods DIR] [--space-age] [--niri]
   fh stop-session [NAME]                     Save and stop only this harness session
   fh install --mods /path/to/Factorio/mods   Install bootstrap (one initial game load)
   fh doctor                                 Check connection and available actions
@@ -70,21 +71,23 @@ async function main() {
     file:{type:'string'}, out:{type:'string'}, mods:{type:'string'}, journal:{type:'string'},
     wait:{type:'boolean'}, 'wait-timeout':{type:'string'},
     name:{type:'string'}, session:{type:'string'}, factorio:{type:'string'}, save:{type:'string'},
-    headless:{type:'boolean'}, 'space-age':{type:'boolean'}, bridge:{type:'boolean'}, server:{type:'string'},
+    headless:{type:'boolean'}, niri:{type:'boolean'}, 'space-age':{type:'boolean'}, bridge:{type:'boolean'}, server:{type:'string'},
     'password-file':{type:'string'}, 'player-data':{type:'string'}, 'bridge-socket':{type:'string'},
   }});
   let command = positionals[0];
   if (!command || values.help || command === 'help') { process.stdout.write(help); return; }
   if (values.format && !['json','compact'].includes(values.format)) throw new Error('--format must be json or compact');
   outputFormat = command === 'stream' || values.format === 'json' ? 'json' : 'compact';
+  // FH_NIRI=1 makes Niri isolation the default for graphical clients.
+  const niri = values.niri ?? (!values.headless && process.env.FH_NIRI === '1');
   if (command === 'start') {
-    output({ok:true,result:await startSession({name:values.name ?? 'default',factorio:values.factorio,save:values.save,headless:values.headless,spaceAge:values['space-age'],bridge:values.bridge})});
+    output({ok:true,result:await startSession({name:values.name ?? 'default',factorio:values.factorio,save:values.save,headless:values.headless,spaceAge:values['space-age'],bridge:values.bridge,niri})});
     return;
   }
   if (command === 'connect') {
     if (!values.server) throw new Error('connect requires --server HOST:PORT');
     output({ok:true,result:await connectSession({name:values.name ?? 'default',server:values.server,factorio:values.factorio,
-      spaceAge:values['space-age'],passwordFile:values['password-file'],playerData:values['player-data'],mods:values.mods})});
+      spaceAge:values['space-age'],passwordFile:values['password-file'],playerData:values['player-data'],mods:values.mods,niri})});
     return;
   }
   if (command === 'stop-session') {

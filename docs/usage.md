@@ -2,7 +2,7 @@
 
 ## Sessions
 
-`fh start` runs a private server plus a graphical client. The client sits in an unfocused nested Niri window, so it never touches your desktop focus or your normal Factorio config, saves and mods.
+`fh start` runs a private server plus a graphical Factorio client that joins it. Both use their own config, mods and saves, so your normal Factorio setup is left alone.
 
 ```sh
 fh start                          # session "default"
@@ -16,13 +16,25 @@ fh stop-session exp               # save, verify the ZIP, stop this session's pr
 - Commands go to the `default` session unless you pass `--session NAME`.
 - Sessions live in `.factorio-harness/sessions/` inside this repository. A name can be used once. To continue a world, start a new session with `--save` pointing at the save `stop-session` printed.
 - Factorio is found in the usual Steam locations. Otherwise use `--factorio PATH` or `FACTORIO_BIN`.
-- Niri needs a window rule matching `app-id="niri" title="^niri$"` with `open-focused false`. `fh start` refuses to launch without it.
-- The graphical window stays usable for things without an action, such as respawning or complex GUIs.
+- The client opens as a normal window. It stays usable for things without an action, such as respawning or complex GUIs.
 - Known issue: outside Steam, the client joins with an empty player name. `--save` therefore rejects saves whose first player has a name.
+
+### Niri isolation (optional)
+
+On the [Niri](https://github.com/YaLTeR/niri) compositor, `--niri` (on `start` or `connect`) runs the client inside an unfocused nested Niri window instead, so launching never steals desktop focus. It needs `niri-harness` on your `PATH` and a window rule in your Niri config:
+
+```kdl
+window-rule {
+    match app-id="niri" title="^niri$"
+    open-focused false
+}
+```
+
+`fh start` refuses to launch with `--niri` if the rule is missing. Set `FH_NIRI=1` to make `--niri` the default.
 
 ## Your own server
 
-Use this on other desktops, or when you host the game yourself:
+Use this when you host the game yourself:
 
 ```sh
 fh install --mods ~/.factorio/mods   # then enable agent-harness and load the save once

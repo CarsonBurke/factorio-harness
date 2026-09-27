@@ -1,4 +1,6 @@
-/** Owned local sessions: graphical by default, never changing host desktop focus. */
+/** Owned local sessions: a private server plus, by default, a graphical client.
+ * With the opt-in Niri isolation the client runs in an unfocused nested
+ * compositor, so it never changes host desktop focus. */
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { access, chmod, copyFile, cp, mkdir, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
@@ -19,9 +21,13 @@ const project = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const sessions = join(project, '.factorio-harness/sessions');
 const steamEnv = { ...process.env, SteamAppId: '427520', SteamGameId: '427520' };
 export interface SessionOptions { name?: string; save?: string; factorio?: string; headless?: boolean; spaceAge?: boolean;
+  /** Run the client in an unfocused nested Niri compositor (needs niri-harness). */
+  niri?: boolean;
   /** Vanilla server (no harness mod) played through the native client bridge. */
   bridge?: boolean }
 export interface ConnectOptions { name?: string; server: string; factorio?: string; spaceAge?: boolean;
+  /** Run the client in an unfocused nested Niri compositor (needs niri-harness). */
+  niri?: boolean;
   /** Server password file; Factorio only accepts it on the command line. */
   passwordFile?: string;
   /** player-data.json carrying the multiplayer identity (service-username/service-token). */
@@ -113,6 +119,16 @@ async function freePort(udp = false): Promise<number> {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   return address.port;
 }
+/** Starts a detached process logging to a private file; undefined if it exited at once. */
+async function spawnOwned(argv: string[], env: NodeJS.ProcessEnv, logPath: string): Promise<ProcessIdentity | undefined> {
+  const log = await open(logPath, 'a', 0o600);
+  try {
+    const child = spawn(argv[0]!, argv.slice(1), { env, stdio: ['ignore', log.fd, log.fd], detached: true });
+    await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    child.unref();
+    return await identity(child.pid!);
+  } finally { await log.close(); }
+}
 async function store(state: State): Promise<void> {
   await writeFile(join(state.directory, 'session.json'), JSON.stringify(state, null, 2), { mode: 0o600 });
 }
@@ -174,14 +190,17 @@ function result(state: State) {
 }
 
 async function requireNiriIsolation(): Promise<unknown> {
-  if (!process.env.NIRI_SOCKET) throw new Error('Graphical launch requires Niri isolation (NIRI_SOCKET). Use --headless explicitly for a server only.');
+  if (!process.env.NIRI_SOCKET) throw new Error('--niri needs a running Niri session (NIRI_SOCKET is unset)');
   const config = join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'niri/config.kdl');
   if (!hasUnfocusedNiriRule(await readFile(config, 'utf8'))) {
     throw new Error('Refusing to launch without the Niri nested-window open-focused false rule; host focus must remain untouched');
   }
-  const focus = JSON.parse((await exec('niri', ['msg', '-j', 'focused-window'])).stdout);
+  const focus = await focusedWindow();
   await exec('niri-harness', ['--help']);
   return focus;
+}
+async function focusedWindow(): Promise<unknown> {
+  return JSON.parse((await exec('niri', ['msg', '-j', 'focused-window'])).stdout);
 }
 
 async function requireBridgeLibrary(): Promise<void> {
@@ -191,17 +210,23 @@ async function requireBridgeLibrary(): Promise<void> {
 
 interface ClientLaunch { mods: string; address: string; bridge: boolean; password?: string }
 
-/** Graphical client in an unfocused nested compositor; with the bridge preloaded when requested. */
-async function launchClient(state: State, launch: ClientLaunch): Promise<void> {
+/** Graphical client, optionally in an unfocused nested compositor; with the bridge preloaded when requested. */
+async function launchClient(state: State, launch: ClientLaunch, niri: boolean): Promise<void> {
   const clientData = join(state.directory, 'client');
   await mkdir(clientData, { recursive: true });
   const clientConfig = join(state.directory, 'client.ini');
   await writeFile(clientConfig, `[path]\nread-data=__PATH__executable__/../../data\nwrite-data=${clientData}\n[graphics]\nfull-screen=false\nv-sync=false\n`);
-  state.niriName = `fh-${createHash('sha256').update(project).digest('hex').slice(0, 8)}-${state.name}`;
   const argv = [state.binary, '--config', clientConfig, '--mod-directory', launch.mods, '--mp-connect', launch.address,
     ...(launch.password ? ['--password', launch.password] : []),
     '--graphics-quality', 'medium', '--video-memory-usage', 'all', '--window-size', '1280x720', '--disable-audio'];
-  const bridgeEnv = launch.bridge ? ['--env', `LD_PRELOAD=${bridgeLibrary}`, '--env', `FH_BRIDGE_SOCKET=${state.bridgeSocket}`] : [];
+  const bridgeEnv = launch.bridge ? { LD_PRELOAD: bridgeLibrary, FH_BRIDGE_SOCKET: state.bridgeSocket! } : {};
+  if (!niri) {
+    state.client = await spawnOwned(argv, { ...steamEnv, ...bridgeEnv }, join(state.directory, 'client.log'));
+    await store(state);
+    if (!state.client) throw new Error('Factorio client exited during launch; inspect client.log');
+    return;
+  }
+  state.niriName = `fh-${createHash('sha256').update(project).digest('hex').slice(0, 8)}-${state.name}`;
   // no-window-wait intentionally avoids niri-harness's restore_host_focus
   // path: it could steal focus if the user changes windows during startup.
   // Use the nested compositor's own Xwayland display. Native Wayland on
@@ -210,7 +235,7 @@ async function launchClient(state: State, launch: ClientLaunch): Promise<void> {
   await exec('niri-harness', ['--json', 'session', 'start', state.niriName, '--root', join(state.directory, 'nested'),
     '--no-window-wait', '--timeout', '30', '--env', 'SDL_VIDEODRIVER=x11',
     '--env', '__GL_SYNC_TO_VBLANK=0', '--env', 'vblank_mode=0', '--env', 'SteamAppId=427520', '--env', 'SteamGameId=427520',
-    ...bridgeEnv, '--cmd', 'exec ' + argv.map(shellQuote).join(' ')],
+    ...Object.entries(bridgeEnv).flatMap(([key, value]) => ['--env', `${key}=${value}`]), '--cmd', 'exec ' + argv.map(shellQuote).join(' ')],
   { env: niriEnvironment(state.directory), timeout: 40_000 });
   const nested = JSON.parse(await readFile(join(state.directory, 'niri-state', state.niriName + '.json'), 'utf8'));
   state.nested = await identity(nested.pid);
@@ -224,13 +249,17 @@ async function launchClient(state: State, launch: ClientLaunch): Promise<void> {
   if (!state.client) throw new Error('Factorio client did not start; inspect nested/session.log');
 }
 
+async function requireClientRunning(state: State): Promise<void> {
+  if (state.nested && !await owned(state.nested)) throw new Error('Nested compositor exited; inspect nested/session.log');
+  if (state.client && !await owned(state.client)) throw new Error('Factorio client exited; inspect client/factorio-current.log');
+}
+
 /** Waits until the bridge's input hook runs inside a multiplayer game. */
 async function awaitBridgeGame(state: State, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let last = 'bridge socket not created yet';
   while (Date.now() < deadline) {
-    if (state.nested && !await owned(state.nested)) throw new Error('Nested compositor exited; inspect nested/session.log');
-    if (state.client && !await owned(state.client)) throw new Error('Factorio client exited; inspect client/factorio-current.log');
+    await requireClientRunning(state);
     // A fresh client per probe: a timed-out probe leaves no state behind.
     const bridge = new BridgeClient(state.bridgeSocket!, 2000);
     try {
@@ -256,12 +285,14 @@ class InactiveBridge extends Error {}
 
 export async function startSession(options: SessionOptions = {}): Promise<ReturnType<typeof result>> {
   const name = validateSessionName(options.name ?? 'default');
-  const binary = await binaryPath(options.factorio);
   const headless = options.headless === true;
   const bridge = options.bridge === true;
+  const niri = options.niri === true;
   if (bridge && headless) throw new Error('--bridge needs the graphical client; it cannot be combined with --headless');
+  if (niri && headless) throw new Error('--niri isolates the graphical client; it cannot be combined with --headless');
+  const binary = await binaryPath(options.factorio);
   if (bridge) await requireBridgeLibrary();
-  const focusBefore = headless ? undefined : await requireNiriIsolation();
+  const focusBefore = niri ? await requireNiriIsolation() : undefined;
   await mkdir(sessions, { recursive: true });
   const directory = join(sessions, name);
   await mkdir(directory, { mode: 0o700 }); // Never overwrite an existing session.
@@ -294,16 +325,10 @@ export async function startSession(options: SessionOptions = {}): Promise<Return
       const creation = await exec(binary, [...common, '--create', state.save], { env: steamEnv, timeout: 120_000, maxBuffer: 8 * 1024 * 1024 });
       await writeFile(join(directory, 'creation.log'), creation.stdout + creation.stderr);
     }
-    const log = await open(join(directory, 'server.log'), 'a', 0o600);
-    try {
-      const child = spawn(binary, [...common, '--start-server', state.save, '--server-settings', settings,
-        '--bind', `127.0.0.1:${state.gamePort}`, '--rcon-bind', `127.0.0.1:${state.rconPort}`, '--rcon-password', password],
-      { env: steamEnv, stdio: ['ignore', log.fd, log.fd], detached: true });
-      await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-      state.server = await identity(child.pid!);
-      child.unref();
-      if (!state.server) throw new Error('Factorio server exited during launch; inspect server.log');
-    } finally { await log.close(); }
+    state.server = await spawnOwned([binary, ...common, '--start-server', state.save, '--server-settings', settings,
+      '--bind', `127.0.0.1:${state.gamePort}`, '--rcon-bind', `127.0.0.1:${state.rconPort}`, '--rcon-password', password],
+    steamEnv, join(directory, 'server.log'));
+    if (!state.server) throw new Error('Factorio server exited during launch; inspect server.log');
     state.status = 'starting'; await store(state);
     const deadline = Date.now() + 120_000;
     while (Date.now() < deadline) {
@@ -327,11 +352,11 @@ export async function startSession(options: SessionOptions = {}): Promise<Return
       profile['service-username'] = state.playerName; profile['service-token'] = '';
       await mkdir(join(directory, 'client'));
       await writeFile(join(directory, 'client/player-data.json'), JSON.stringify(profile), {mode:0o600});
-      await launchClient(state, { mods, address: `127.0.0.1:${state.gamePort}`, bridge });
+      await launchClient(state, { mods, address: `127.0.0.1:${state.gamePort}`, bridge }, niri);
       let connected = false;
       const graphicalDeadline = Date.now() + 120_000;
       while (Date.now() < graphicalDeadline) {
-        if (!await owned(state.nested!)) throw new Error('Nested compositor exited; inspect nested/session.log');
+        await requireClientRunning(state);
         // Exiting the introduction is the same normal action as skipping its
         // cutscene in the client; no inventory, character, or map is created.
         const reply = await client.command('/silent-command local p=game.connected_players[1]; if p and p.controller_type==defines.controllers.cutscene then p.exit_cutscene() end; rcon.print(p and p.character and p.controller_type==defines.controllers.character and helpers.table_to_json{index=p.index,name=p.name} or "waiting")');
@@ -346,10 +371,10 @@ export async function startSession(options: SessionOptions = {}): Promise<Return
         }
         await delay(250);
       }
-      if (!connected) throw new Error('Graphical client did not join with a character; inspect nested/session.log');
+      if (!connected) throw new Error('Graphical client did not join with a character; inspect client/factorio-current.log');
       if (bridge) await awaitBridgeGame(state, 60_000);
-      state.focusAfter = JSON.parse((await exec('niri', ['msg', '-j', 'focused-window'])).stdout);
       // Never restore host focus: the user may deliberately have changed it.
+      if (niri) state.focusAfter = await focusedWindow();
     }
     state.status = 'ready'; await store(state);
     return result(state);
@@ -389,7 +414,8 @@ export async function connectSession(options: ConnectOptions): Promise<ReturnTyp
   const binary = await binaryPath(options.factorio);
   await requireBridgeLibrary();
   const password = options.passwordFile ? (await readFile(options.passwordFile, 'utf8')).trimEnd() : undefined;
-  const focusBefore = await requireNiriIsolation();
+  const niri = options.niri === true;
+  const focusBefore = niri ? await requireNiriIsolation() : undefined;
   await mkdir(sessions, { recursive: true });
   const directory = join(sessions, name);
   await mkdir(directory, { mode: 0o700 }); // Never overwrite an existing session.
@@ -410,9 +436,9 @@ export async function connectSession(options: ConnectOptions): Promise<ReturnTyp
       await chmod(join(directory, 'client/player-data.json'), 0o600);
     }
     state.status = 'joining'; await store(state);
-    await launchClient(state, { mods, address, bridge: true, password });
+    await launchClient(state, { mods, address, bridge: true, password }, niri);
     await awaitBridgeGame(state, options.joinTimeoutMs ?? 180_000);
-    state.focusAfter = JSON.parse((await exec('niri', ['msg', '-j', 'focused-window'])).stdout);
+    if (niri) state.focusAfter = await focusedWindow();
     state.status = 'ready'; await store(state);
     return result(state);
   } catch (error) {
