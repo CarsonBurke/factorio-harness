@@ -8,7 +8,9 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc",
+    "build:bridge": "make -C bridge",
     "test": "npm run build && node --test dist/tests/*.test.js",
+    "test:bridge": "make -C bridge test",
     "test:integration": "npm run build && node dist/scripts/integration.js",
     "fh": "node dist/host/cli.js"
   },

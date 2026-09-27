@@ -71,9 +71,7 @@ test('compact CLI output preserves failure details and nonzero exit status',asyn
   await engine(()=>({ok:false,error:{code:'placement_blocked',message:'Cannot build here'}}),async port=>{
     await assert.rejects(cli(port,['call','build','--format','compact']), (error:any)=>{
       assert.equal(error.code,1);
-      assert.match(error.stdout,/ok: false/);
-      assert.match(error.stdout,/code: placement_blocked/);
-      assert.match(error.stdout,/message: "Cannot build here"/);
+      assert.match(error.stdout,/^error: code=placement_blocked message="Cannot build here"/);
       return true;
     });
   });
@@ -84,5 +82,28 @@ test('CLI defaults to compact output',async()=>{
     const {stdout}=await exec(process.execPath,['dist/host/cli.js','--port',String(port),'queue','status'],{env:{...process.env,FACTORIO_RCON_PASSWORD:'test-only'}});
     assert.match(stdout,/revision: 5/);
     assert.throws(()=>JSON.parse(stdout));
+  });
+});
+test('blueprint inspection uses the existing read-only export protocol',async()=>{
+  await engine(request=>{
+    assert.equal(request.action,'blueprint_export');
+    assert.deepEqual(request.args,{slot:'plan',layout:true});
+    return {ok:true,result:{layout:[]}};
+  },async port=>{await cli(port,['blueprint','inspect','--args','{"slot":"plan"}']);});
+});
+test('a --wait that outlasts its timeout reports the action still running, after showing acceptance in compact output',async()=>{
+  await engine(request=>{
+    if(request.action==='construct')return {ok:true,result:{until_tick:36000,total:4}};
+    return {ok:true,result:{active:{kind:'construct',remaining:4,awaiting_craft:true}}};
+  },async port=>{
+    try {
+      await exec(process.execPath,['dist/host/cli.js','--port',String(port),'call','construct','--wait','--wait-timeout','250'],{env:{...process.env,FACTORIO_RCON_PASSWORD:'test-only'}});
+      assert.fail('an unfinished wait must exit nonzero');
+    } catch(error:any) {
+      assert.equal(error.code,1);
+      assert.match(error.stdout,/^tick: 1\nwaiting: .*\nuntil_tick: 36000\ntotal: 4\n/);
+      assert.match(error.stdout,/wait_timeout/);
+      assert.match(error.stdout,/awaiting_craft/);
+    }
   });
 });

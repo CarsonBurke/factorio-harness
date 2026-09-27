@@ -1,189 +1,210 @@
 # Factorio harness
 
-A CLI for agents to play Factorio through a real character. Gameplay runs in Lua inside Factorio; a small TypeScript process handles RCON, JSON, live deployment, and local map images. There is no MCP server, Python service, or production npm dependency.
+Lets an agent play Factorio 2.0 as a normal character, through a shell CLI.
 
-The project targets **Factorio 2.0**. Start with the commands below; `describe` reports the running version's complete action interface. This is an initial engineering foundation, not yet a proven autonomous deathworld player.
+The agent reads the world and gives orders with `fh` commands: walk here, mine that, craft this, paste a blueprint, defend the base. A Lua mod carries out each order tick by tick inside the game, under the same rules as a human player. There is no teleporting, no free items, and no map reveal. Items come from the inventory, reach is enforced, and combat uses real guns and ammo.
 
-## Quick start: graphical by default
+```sh
+fh start --space-age                 # private server plus a graphical client, ready to play
+fh observe                           # what's around the character
+fh call move_to --args '{"position":{"x":40,"y":-12}}' --wait
+fh call mine --args '{"position":{"x":41.5,"y":-11.5},"ticks":300}' --wait
+fh call craft --args '{"recipe":"iron-gear-wheel","count":10}'
+fh stop-session                      # save and shut down
+```
 
-Requirements: Node.js 20+, npm, Factorio 2.0, and Niri plus `niri-harness` for the focus-safe graphical launcher. The installed Steam/Flatpak location is autodetected. Use `--factorio /path/to/factorio` for another installation. Lua is needed for development tests.
+> **Status:** usable foundation, not a finished autonomous player. The action set is broad, but no built-in policy plays a whole game on its own. That part is up to your agent.
+
+## How it works
+
+```text
+agent ── shell ──► fh (Node CLI) ── RCON ──► agent-harness mod (Lua, in-game)
+                     JSON replies ◄──────────  runs actions every tick
+```
+
+- **In game (Lua):** a small bootstrap (`control.lua`) plus a hot-swappable runtime (`runtime.lua` and sibling modules). Long-running actions such as walking, pathing, mining, building, and fighting run inside the simulation, so they need no agent round trip per tick.
+- **Host (TypeScript):** `fh` handles RCON, JSON, session management, live code deployment, and PNG rendering. It has no runtime npm dependencies, no MCP server, and no LLM API key. Any agent that can run shell commands can use it.
+- **Client bridge (optional, C++):** lets you play on servers you don't control. See [below](#playing-on-servers-you-dont-control).
+
+Details: [docs/architecture.md](docs/architecture.md).
+
+## Requirements
+
+- Node.js 20+ and npm
+- Factorio 2.0. A Steam or Flatpak install is detected automatically; otherwise pass `--factorio PATH` or set `FACTORIO_BIN`. Space Age is optional.
+- For the managed graphical session (`fh start`): the [Niri](https://github.com/YaLTeR/niri) compositor, `niri-harness`, and a Niri window rule that opens nested windows with `open-focused false`. On other setups, use [manual mode](#manual-mode-your-own-server).
+- For development: Lua, to run the Lua unit tests.
+
+## Setup
 
 ```sh
 npm ci
 npm run build
-node dist/host/cli.js start --space-age
-node dist/host/cli.js doctor
-node dist/host/cli.js observe
-node dist/host/cli.js view --out artifacts/local-map.png
-node dist/host/cli.js stop-session
+npm link          # optional: installs the `fh` command (otherwise use node dist/host/cli.js)
 ```
 
-`start` creates a private local server and joins it with a **graphical client** inside an unfocused nested Niri window. The outer window uses the existing `open-focused false` rule. The launcher never restores old focus, so it also respects a user changing windows during startup. It refuses an unprotected launch rather than taking focus. Your existing Factorio process, configuration, saves, and mods are not touched.
+## Sessions
 
-The default session is named `default`; later CLI commands connect to it automatically. Use `start --name experiment` and `--session experiment` for parallel worlds. `--space-age` enables installed Space Age dependencies; omit it for base-game starts. `--save /path/to/world.zip` loads a private copy and verifies that the client rejoins its first saved player; an identity mismatch aborts the launch. Use saves compatible with the selected base-game/Space Age profile; the launcher does not import custom mod packs. Nothing in the launcher grants equipment or research.
-
-`stop-session [NAME]` saves the owned world, waits for a complete save, and stops only the processes recorded for that session. It reports the save path. Session directories are retained under `.factorio-harness/sessions/` and are not overwritten: to continue a stopped world, start a new name with `--save` pointing to that returned save. A PID ownership check prevents stopping an unrelated process after PID reuse.
-
-On this workstation, the Steam executable launched outside Flatpak joins with an empty player name despite isolated profile settings. Fresh worlds and matching empty-name saves work. Existing named Steam saves currently need the manual connection path below; the launcher rejects mismatches instead of silently creating a replacement character.
-
-For development or remote hosting, `start --headless` explicitly starts only the private server. Player actions still need a graphical client to join; headless-only mode supports runtime deployment and diagnostics immediately. On other desktops, launch Factorio normally and use the manual RCON connection below.
-
-The examples below use `fh` for `node dist/host/cli.js`. `npm link` can install the short command. Normal movement, crafting, and inspection look like this:
+`fh start` creates a self-contained world. It runs a private local server and a graphical client. The client runs inside an unfocused nested Niri window, so your desktop focus is never touched. Your existing Factorio config, saves, and mods are also left alone.
 
 ```sh
-fh describe
+fh start                              # base game, session "default"
+fh start --space-age --name exp       # a second, independent world
+fh start --save ~/saves/base.zip      # play a private copy of an existing save
+fh start --headless                   # server only (for deployment/diagnostics; no character)
+fh doctor                             # is the runtime loaded and the character controllable?
+fh stop-session exp                   # save, verify the ZIP, stop only this session's processes
+```
+
+- Commands target the `default` session automatically. Use `--session NAME` for any other session.
+- Session data lives in `.factorio-harness/sessions/NAME/`. Directories are never reused. To continue a stopped world, run `fh start --name new --save <path printed by stop-session>`.
+- The graphical window stays usable for things without a dedicated action, such as respawn dialogs and complex GUIs. The session reports its `niri_session`, so `niri-harness` can inspect or drive the nested window.
+
+## Playing
+
+### The loop
+
+Agents work in an **observe → act → verify** loop:
+
+```sh
+fh describe                                   # every action and its arguments, from the running runtime
+fh observe --args '{"radius":24}'             # nearby entities, inventory, crafting, research
 fh call walk --args '{"direction":"east","ticks":60}' --wait
-fh call craft --args '{"recipe":"iron-gear-wheel","count":2}'
-fh call status
-fh call stop
+fh call status                                # active controls, last outcome, alerts
 ```
 
-## Manual connection
+- `fh call ACTION --args JSON` runs any action. `--args-file F` reads the arguments from a file.
+- Timed actions (walk, mine, move_to, construct, …) return as soon as the game accepts them. Add `--wait` to block until they finish and get the outcome, such as `arrived`, `target_mined`, or `inventory_full`. The command exits nonzero if the action fails or is interrupted.
+- Pressing Ctrl-C or closing the CLI does **not** stop work the game has already accepted. Use `fh call stop` or `fh queue cancel` for that.
+- Output is compact labelled tables by default, which is easy for an LLM to read. Programs should pass `--format json`.
 
-Requirements: Node.js 20+, npm, and Factorio 2.0. Lua is also required for the development tests. The free headless distribution can host a world, but a licensed graphical client is needed to join as a player; Space Age is needed for mecha armour.
+### What the character can do
+
+`describe` is the source of truth. It covers all argument names, limits, and result fields. Here is an overview:
+
+| Area | Actions |
+|---|---|
+| Looking | `observe`, `status`, `scan`, `nearest`, `map` (charted overview), `grid` (ASCII tile map), `inspect`, `power`, `stock`, `recipes`, `craftable`, `technologies`, `screenshot` |
+| Moving | `walk`, `move_to` (engine pathfinder with stall recovery), `stop` |
+| Gathering | `mine`, `pickup`, `transfer`, `collect` (walks a route through machines/chests holding an item) |
+| Crafting & research | `craft`, `cancel_craft`, `research`, `research_next` |
+| Building | `build`, `rotate`, `configure`, `wire`, `build_path` (lay belts while walking), `belt_route` / `pipe_route` (routed placement with undergrounds), `place_ghosts`, `construct` (build all ghosts by hand from inventory), `deconstruct`, `revive_ghost` |
+| Blueprints | `blueprint_import`/`export`/`list`/`delete`/`capture`/`place`, `copy`, `cut`, `paste` |
+| Upkeep & analysis | `rearm`, `refuel`, `repair`, `rates` (production/consumption per minute), `bottleneck` |
+| Combat | `shoot` (manual or auto-target), `kite` (hold distance while clearing), `equip`, `equipment` |
+| Space Age | `requests`, `platforms`, `platform_create`, `platform_schedule`, `launch` (optionally riding along), `land` |
+| Queue | `queue_submit`, `queue_repeat`, `queue_status`, `queue_edit`, `queue_cancel`, `queue_resume`, `wait_ticks`, `wait_until` |
+
+Two helpers are also available as subcommands:
 
 ```sh
-npm ci
-npm run build
-node dist/host/cli.js install --mods "$HOME/.factorio/mods"
+fh view --out artifacts/map.png        # schematic PNG of the observed area (north up)
+fh blueprint import --file smelter.txt --args '{"slot":"smelter"}'
+fh blueprint place  --args '{"slot":"smelter","position":{"x":5,"y":5},"direction":"east"}'
+fh blueprint export --args '{"slot":"smelter"}' --out smelter.txt
+fh blueprint inspect --args '{"slot":"smelter"}'   # relative layout + material cost
 ```
 
-Enable `agent-harness` and load a save. This one-time bootstrap installation requires a game load. **Subsequent Lua runtime and module updates use `deploy` or `watch`, without restarting or reloading the save.** Changes to prototypes, mod dependencies, or the bootstrap itself still follow Factorio's normal reload requirements.
+### The in-game queue
 
-Host a local server with RCON enabled, using your own save and password:
+To react faster than a CLI round trip, submit a short plan for the game to run itself:
+
+```json
+[
+  {"action":"shoot","args":{"auto":true,"radius":24,"ticks":300},"wait":false},
+  {"action":"walk","args":{"direction":"west","ticks":90}},
+  {"action":"wait_until","args":{"until":"no_enemies","radius":24}}
+]
+```
 
 ```sh
-export FACTORIO_RCON_PASSWORD='your-local-password'
-factorio --start-server /path/to/save.zip \
-  --rcon-bind 127.0.0.1:27015 \
-  --rcon-password "$FACTORIO_RCON_PASSWORD"
+fh queue submit --file examples/skirmish.json
+fh queue status                     # revision, active step, pending steps, recent results
+fh queue edit --args '{"expected_revision":7,"index":1,"remove":1,"steps":[...]}'
+fh queue cancel                     # stop now and drop pending steps ({"clear":false} keeps them)
+fh queue resume
 ```
 
-Use a private server-settings file if needed; Factorio's multiplayer authentication settings are independent of RCON. RCON has operator privileges, so keep it on loopback or a trusted tunnel. The graphical launcher runs a private local server and joins it with a graphical client. Join once with your client so a normal player character exists. A newly created headless save has no player.
+- Steps run in order. `"wait":false` lets a step overlap the next one, for example shooting while walking.
+- A failed step pauses the queue. Steps can use `label` and `on_fail` (`skip`, `goto:<label>`), and `guards` can interrupt the plan when a condition fires.
+- Edits must pass the current `expected_revision`. That way a plan the game has already moved past is never edited silently.
+- A direct `fh call` pauses the running queue, so a stale plan can't override your latest decision. `queue_repeat` runs a plan on a loop.
 
-Credentials can instead come from `FACTORIO_RCON_PASSWORD_FILE`. Optional environment variables: `FACTORIO_RCON_HOST`, `FACTORIO_RCON_PORT`. Passwords are never recorded in the action journal.
-
-Managed sessions automatically target their connected player; manual connections default to player 1. `--player N` overrides either choice. A connected, living character is required, including when the server is headless. `attach` supports an explicit testing opt-in for cheat mode. Game ticks determine action duration; a paused server cannot advance actions.
-
-## Agent interface
-
-Commands return JSON. Rejected actions exit nonzero. Tool arguments are discovered from the running game with `describe`, so a live extension is immediately usable without rebuilding the host.
-
-For low overhead, `stream` keeps one authenticated RCON connection open and accepts one request per line. Each response is one line. Individual errors do not terminate the stream.
+### Batch and streaming
 
 ```sh
-printf '%s\n' \
-  '{"id":"observe-1","action":"observe","args":{"radius":16}}' \
-  '{"id":"walk-1","action":"walk","args":{"direction":"east","ticks":30}}' \
-  | fh stream
+fh run --file plan.json     # a JSON array of requests, run in order; waits on timed actions; stops at the first failure
+fh stream                   # JSON lines in, JSON lines out, over one persistent connection
 ```
 
-`run --file plan.json` executes a JSON array of requests sequentially, waits for timed actions, and stops on the first failure. Crafting is asynchronous: `started` reports queued crafts, not completed inventory. Observe the crafting queue before using its products. Plans are useful for deterministic sequences; an agent can adapt by inspecting each JSON response. No LLM API key or built-in model loop is required.
+## Reliability and the rules
 
-Pass `--journal artifacts/session.jsonl` to retain requests and replies. Create its parent directory first. Mutations accept `--id` for recovery. The game caches up to 256 recent mutation results, bounded to 8 MiB total, across runtime updates and save/load. Repeating the **identical request** with the same ID returns the cached result; reuse with changed arguments is rejected. This is a bounded deduplication window, not a forever-valid transaction log. Read-only queries are always fresh.
+- **Survival rules.** Every gameplay action goes through normal player mechanics. It costs items, respects reach, and takes game time. Nothing spawns items, teleports, or reveals the map. The only exception is an explicit testing opt-in (`attach` with `allow_cheat_mode`).
+- **Retries and uncertainty.** Pass `--id ID` on a mutating call. If the reply is lost, the CLI reports `outcome_unknown` and does **not** replay the call. Check the game state, then retry with the same ID. The game keeps the last 256 results (up to 8 MiB), so an identical repeat returns the cached result instead of acting twice. Reusing an ID with different arguments is rejected.
+- **Partial effects.** Some actions, such as a transfer, can partly succeed. Read the counts in the reply instead of assuming all-or-nothing.
+- **Journal.** `--journal session.jsonl` records every request and reply. Passwords are never logged.
 
-A lost transport response is `outcome_unknown`: the action may have run. The host **does not replay it automatically**. Inspect state and retry the same ID only while its result remains cached. The next call reconnects. Gameplay errors can have partial effects (for example, a partly fulfilled inventory transfer); inspect returned counts and state rather than assuming atomicity.
+## Live development
 
-## Seeing the world
-
-`observe` returns local visible entities, inventory, position, jobs, and research, with explicit truncation flags. Add `"tiles":true` for terrain. Queries have hard radius and count bounds; they do not reveal the whole map.
-
-`view` renders these observations into a PNG with north up. This is a schematic, not Factorio's sprites: dark background is unknown, the white square is the character, blue/orange/black marks indicate iron/copper/coal, green indicates trees or uranium, and tan indicates structures. `view` returns the image path and compact metadata; use `observe` for full entity coordinates and details. Truncated observations produce incomplete maps.
-
-The `screenshot` action requests a real Factorio screenshot in the graphical client's `script-output` directory. Screenshots are asynchronous and the CLI reports a request, not proof that the file exists. A headless process cannot render screenshots. Prefer structured observations and the local schematic for automation; use real screenshots when visual inspection adds information.
-
-## Live development and recovery
+The runtime can be replaced **while the game is running**, with no restart or reload:
 
 ```sh
-# Bundle runtime.lua plus its sibling Lua modules, validate, then replace live code.
-fh deploy
-fh watch
-# A custom runtime directory works too; control.lua is excluded from the bundle.
-fh deploy --file /path/to/runtime.lua
+fh deploy        # bundle runtime.lua + sibling modules, validate, hot-swap
+fh watch         # redeploy on every file change
 ```
 
-The bootstrap persists a successful bundle in the save, reconstructs it during `on_load`, and keeps event registrations stable. Invalid syntax or an invalid runtime contract leaves the previous runtime active. Successful replacement stops active controls first. The watcher hashes the whole bundle, so editing a sibling module also triggers deployment. It retries failures known to precede deployment and reports rejected revisions once per content change. An uncertain deployment outcome stops the watcher; inspect the game before restarting it.
+- A deploy with a syntax or contract error is rejected, and the old runtime keeps running.
+- A successful deploy stops active controls and pauses the queue.
+- The deployed bundle is saved inside the save file and reloads with it.
+- If the runtime crashes during a tick, it is quarantined. `status` and `describe` report the fault, and gameplay commands are refused until a fixed deploy succeeds.
+- Module top-level code must be pure: define functions and constants only, without touching the game. Persistent state lives in `storage.agent_harness`.
 
-A tick-loop fault stops controls and quarantines the runtime. `describe` and `status` expose the fault; further gameplay mutations are rejected until a corrected deployment succeeds. This avoids repeated execution of broken code while keeping diagnostics available.
+Changes to prototypes, mod dependencies, or `control.lua` itself still need a normal game reload.
 
-Runtime top-level code must be pure: no game access or storage mutation during module loading. Only function bodies may operate on the game. Deployment is trusted developer code, not a sandbox. The gameplay API excludes spawning items, teleporting, revealing the map, free crafting, and instant mining. Testing fixtures deliberately use operator commands to arrange controlled experiments; those commands are outside the gameplay interface.
+## Manual mode (your own server)
+
+Use this on non-Niri desktops, or to host the world yourself:
+
+```sh
+fh install --mods ~/.factorio/mods     # then enable agent-harness and load your save once
+factorio --start-server save.zip --rcon-bind 127.0.0.1:27015 --rcon-password "$FACTORIO_RCON_PASSWORD"
+export FACTORIO_RCON_PASSWORD=...      # or FACTORIO_RCON_PASSWORD_FILE; FACTORIO_RCON_HOST / _PORT optional
+```
+
+Join with a graphical client, because an agent needs a connected, living character. Commands target player 1 unless you pass `--player N`. RCON has full operator rights, so keep it on loopback or a trusted tunnel.
+
+## Playing on servers you don't control
+
+The client bridge is an `LD_PRELOAD` library for **your own** Factorio client. It turns agent commands into the same input actions the GUI sends, so the server needs no mod and no RCON, and it sees an ordinary player. **Only use it where the server's operator allows automated play.**
+
+```sh
+npm run build:bridge
+fh connect --server 203.0.113.5:34197 --name mp [--player-data ~/.factorio/player-data.json] [--password-file F]
+fh --session mp observe
+fh --session mp call walk --args '{"direction":"east","ticks":120}' --wait
+fh start --bridge --name trial         # try it against a private vanilla server first
+```
+
+The bridge supports a smaller action set: `observe`, `scan`, `walk`, `mine`, `craft`, `build`, and `stop`. It only works on Linux x86-64, and only with the specific Factorio build it was derived from (2.0.77, Steam). Design, verification, and limits: [docs/bridge.md](docs/bridge.md).
+
+## Limitations
+
+- No dedicated controllers yet for vehicles, rail placement, circuit-network editing, or fluid transfers. Use the graphical window for these.
+- Observations are bounded in radius and count, so check the `truncated` flags. Areas under fog are not remembered from earlier sightings.
+- `screenshot` needs a graphical client, and it only *requests* a capture. The file appears asynchronously in `script-output`.
+- One controller per player. Agents sharing one character must coordinate outside the harness.
+- On the tested Steam build, a client launched outside Steam joins with an empty player name. `fh start --save` therefore rejects saves whose player has a different name, rather than silently creating a new character. Use manual mode for those saves.
 
 ## Development
 
 ```sh
-npm test                  # TypeScript build, framing/recovery, Lua quoting/bundling, PNG tests
-npm run test:integration  # Real Factorio engine; see docs/testing.md for fixtures
+npm test                    # TypeScript build, host tests, Lua unit tests against a fake engine
+npm run test:integration    # against a real Factorio engine
+npm run test:bridge         # client bridge unit tests
 ```
 
-See [architecture](docs/architecture.md) for the boundaries and extension contract, and [testing](docs/testing.md) for evidence and limitations. The existing repository license is preserved.
+Test setup, fixtures, and what has been verified on real builds: [docs/testing.md](docs/testing.md). To add an action, put a handler in the runtime's handler table, describe it in `describe`, and add a test covering both the useful behavior and the rule it must not break. See [docs/architecture.md](docs/architecture.md#hot-reload-contract).
 
-## Tick queues and combat
+## License
 
-For responsive control, submit a short plan to the **in-game queue** instead of round-tripping each movement through the agent:
-
-```sh
-fh queue submit --file examples/skirmish.json
-fh queue status
-# Replace the first pending step, only if the queue has not changed since revision 7:
-fh queue edit --args '{"expected_revision":7,"index":1,"remove":1,"steps":[{"action":"walk","args":{"direction":"north","ticks":30}}]}'
-fh queue cancel                  # Stop active controls and discard pending work
-fh queue cancel --args '{"clear":false}'  # Stop and retain pending work, paused
-fh queue resume
-fh call stop                     # Emergency stop also pauses pending work
-```
-
-Queue status includes a revision, active job, pending jobs, and the last 64 results. Pending edits require the current revision so an old observation cannot silently edit a different plan. `queue_submit` appends by default; `mode:"replace"` replaces only pending steps. Cancel explicitly to interrupt the active step. A failed step pauses the queue with the remaining plan intact. Reload and direct gameplay commands also pause queued execution so stale plans do not override the next decision.
-
-By default a step waits for its timed control to finish. `wait:false` lets shooting overlap movement. The queue accepts at most 128 pending steps with a 1 MiB argument budget and executes at most four instant steps per game tick. `wait_ticks` is a queue-only simulation delay. The queue is for a short control horizon; agents should inspect observations and job outcomes, then revise it. It does not infer success from arrival time or navigate around obstacles automatically.
-
-`shoot` applies normal shooting input on each tick using equipped weapons and ammunition. Auto targeting chooses local hostile targets; aim, range, cooldown, collision, damage, shields, and ammunition remain engine-controlled. A movement command does not cancel firing; `stop` cancels both. Equipment and armour are managed using owned inventory items. Mecha armour requires Space Age and an explicitly provisioned start; the harness does not grant it through gameplay commands. Vanilla starts use the same tools.
-
-## Blueprints, ghosts, and construction
-
-The runtime exposes `blueprint_import`, `blueprint_export`, `blueprint_list`, `blueprint_capture`, `copy`, `cut`, `blueprint_place`, `paste`, `deconstruct`, `cancel_deconstruction`, and `revive_ghost`. Use `describe` for exact argument names.
-
-Blueprints use native Factorio strings and persistent named slots, including books and nested selection. Copy captures real entities and their settings; cut captures first and marks originals for normal deconstruction. Paste creates ghosts; it never creates free finished structures. `revive_ghost` uses an owned matching-quality item and ordinary cursor placement within character reach. Construction robots can build ghosts and remove deconstruction-marked entities normally.
-
-Rotation and flips go through the engine's blueprint placement. Grid snapping is disabled on the temporary paste copy so the supplied position is explicit; the original string and its grid settings remain intact for export. Spatial actions are bounded to the currently visible local area. Imports and books have explicit size limits. Cursor-based operations require an empty cursor and restore borrowed stacks; an occupied cursor produces a recoverable error instead of discarding the player's items.
-
-Blueprint file convenience commands avoid putting large strings in shell arguments:
-
-```sh
-fh blueprint import --file smelter.txt --args '{"slot":"smelter"}'
-fh blueprint place --args '{"slot":"smelter","position":{"x":5,"y":5},"direction":"east"}'
-fh blueprint export --args '{"slot":"smelter"}' --out artifacts/smelter.txt
-```
-
-Any call also accepts `--args-file request-arguments.json`. Blueprint books use `book_path` to select nested 1-based inventory slots. `build` reports consumed items and the actual placed entity position: use that returned position for later transfers because the engine can snap input coordinates to the placement grid.
-
-Closing the CLI or pressing Ctrl-C does not cancel work already accepted by the game. Use `fh queue cancel` or `fh call stop` to stop controls. Standalone input actions expire after at most 600 ticks; queued plans continue independently until completion, cancellation, a runtime fault, or loss of the connected character.
-
-The graphical window remains available for normal GUI operations that do not yet have dedicated actions, including respawn dialogs and complex editors. A managed session also reports its private `niri_session` and `niri_state` directory; `niri-harness` can inspect or operate that nested session without sending input to the host desktop. Check `niri-harness --help` for its observation and input commands. Vehicles, arbitrary circuit editing, automatic navigation, and autonomous deathworld tactics are not yet implemented as dedicated controllers.
-
-### Compact agent output
-
-Use `fh observe --format compact` for labelled observations with shared column
-headers for entity and inventory rows. Nested coordinates become `position.x`
-and `position.y` columns. All returned fields remain visible, including request
-IDs, errors and truncation flags; `<absent>` marks a missing table cell. Strings
-containing whitespace or delimiters are quoted and escaped. This is a display
-format, not a serialization contract.
-
-Compact output is the default. Programs that parse CLI replies must request
-`--format json` explicitly. `fh stream` always emits JSONL, even with `--format compact`. The RCON
-protocol and journals stay JSON. Narrow observations with `entity_names`,
-`entity_types`, `exclude_resources`, and `radius` to avoid requesting irrelevant
-state in either format. No implicit delta cache hides changes between calls.
-
-Observations summarize connected resource tiles as `resource_patches` by default,
-so a large deposit cannot crowd machines out of the entity limit. Each row gives
-observed tile count, amount and bounding coordinates; it covers only the visible
-portion inside the requested radius, and the bounding rectangle can contain gaps.
-Use `resources: "tiles"` when individual ore tiles are needed or `"none"` to omit
-resources. Entity rows include native operating status, including `no_power`.
-
-`fh blueprint inspect --args '{"slot":"clipboard"}'` returns Factorio's normalized
-relative layout and material costs without a base64 export string. Native cursor
-placement can snap and center the layout: always use returned ghost coordinates
-when connecting a placed blueprint to existing infrastructure. Inspection uses
-the existing read-only export operation, so errors do not interrupt active controls.
+[MIT](LICENSE)

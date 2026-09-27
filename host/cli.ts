@@ -11,7 +11,8 @@ import { Harness, type Reply } from './harness.js';
 import { renderMap } from './view.js';
 import { formatCompact } from './format.js';
 import { bundleRuntime } from './bundle.js';
-import { startSession, stopSession, sessionConnection } from './session.js';
+import { startSession, stopSession, sessionConnection, connectSession, type SessionConnection } from './session.js';
+import { BridgeClient, BridgeOutcomeUnknown } from './bridge.js';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const modPath = resolve(root, 'mod/agent-harness_0.1.0');
@@ -19,6 +20,9 @@ const help = `fh — Factorio agent CLI
 
   fh start [--name default] [--space-age]     Start graphical game without taking Niri focus
   fh start --headless                        Start only the private server
+  fh start --bridge                          Vanilla private server played through the client bridge
+  fh connect --server HOST:PORT [--name mp]  Join someone else's server with a bridged client
+       [--password-file F] [--player-data player-data.json] [--mods DIR] [--space-age]
   fh stop-session [NAME]                     Save and stop only this harness session
   fh install --mods /path/to/Factorio/mods   Install bootstrap (one initial game load)
   fh doctor                                 Check connection and available actions
@@ -37,14 +41,15 @@ const help = `fh — Factorio agent CLI
   fh stream                                 JSON-lines requests in, replies out; one connection
   fh run --file plan.json                    Sequential actions, waits after each timed action
 
-Options: --player N (default 1), --host HOST, --port N, --timeout MS,
-         --session NAME (default: auto-use default session),
+Options: --player N (default 1), --host HOST, --port N, --timeout MS (default 5000; deploy/watch 60000),
+         --session NAME (default: auto-use default session), --bridge-socket PATH (bridge without a session),
          --wait, --wait-timeout MS (default 30000), --journal PATH, --args-file PATH
          --format json|compact (default compact; stream always uses JSONL)
 Credentials: FACTORIO_RCON_PASSWORD or FACTORIO_RCON_PASSWORD_FILE
 Endpoint: FACTORIO_RCON_HOST (127.0.0.1), FACTORIO_RCON_PORT (27015)
 Stream input: {"action":"observe","args":{},"id":"optional-stable-id"}
 Plan input: [{"action":"walk","args":{"direction":"east","ticks":60}}, ...]
+Bridge sessions (start --bridge, connect) act only through normal player input; deploy/watch/view need the harness mod.
 No automatic replay of mutations. stdout uses compact labelled tables; --format json is for programs. Diagnostics go to stderr.
 `;
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -65,14 +70,21 @@ async function main() {
     file:{type:'string'}, out:{type:'string'}, mods:{type:'string'}, journal:{type:'string'},
     wait:{type:'boolean'}, 'wait-timeout':{type:'string'},
     name:{type:'string'}, session:{type:'string'}, factorio:{type:'string'}, save:{type:'string'},
-    headless:{type:'boolean'}, 'space-age':{type:'boolean'},
+    headless:{type:'boolean'}, 'space-age':{type:'boolean'}, bridge:{type:'boolean'}, server:{type:'string'},
+    'password-file':{type:'string'}, 'player-data':{type:'string'}, 'bridge-socket':{type:'string'},
   }});
   let command = positionals[0];
   if (!command || values.help || command === 'help') { process.stdout.write(help); return; }
   if (values.format && !['json','compact'].includes(values.format)) throw new Error('--format must be json or compact');
   outputFormat = command === 'stream' || values.format === 'json' ? 'json' : 'compact';
   if (command === 'start') {
-    output({ok:true,result:await startSession({name:values.name ?? 'default',factorio:values.factorio,save:values.save,headless:values.headless,spaceAge:values['space-age']})});
+    output({ok:true,result:await startSession({name:values.name ?? 'default',factorio:values.factorio,save:values.save,headless:values.headless,spaceAge:values['space-age'],bridge:values.bridge})});
+    return;
+  }
+  if (command === 'connect') {
+    if (!values.server) throw new Error('connect requires --server HOST:PORT');
+    output({ok:true,result:await connectSession({name:values.name ?? 'default',server:values.server,factorio:values.factorio,
+      spaceAge:values['space-age'],passwordFile:values['password-file'],playerData:values['player-data'],mods:values.mods})});
     return;
   }
   if (command === 'stop-session') {
@@ -116,33 +128,71 @@ async function main() {
   }
   const known = new Set(['doctor','describe','observe','call','view','deploy','watch','stream','run']);
   if (!known.has(command)) throw new Error(`Unknown command ${command}; use fh help`);
-  let connection: Awaited<ReturnType<typeof sessionConnection>> | undefined;
+  let connection: SessionConnection | undefined;
   if (values.session) {
-    if (values.host || values.port) throw new Error('Use --session or --host/--port, not both');
+    if (values.host || values.port || values['bridge-socket']) throw new Error('Use --session, --bridge-socket, or --host/--port, not several');
     connection = await sessionConnection(values.session);
+  } else if (values['bridge-socket']) {
+    if (values.host || values.port) throw new Error('Use --bridge-socket or --host/--port, not both');
+    connection = {kind:'bridge', socket:resolve(values['bridge-socket']), player:1};
   } else if (!values.host && !values.port && !process.env.FACTORIO_RCON_HOST && !process.env.FACTORIO_RCON_PORT && !process.env.FACTORIO_RCON_PASSWORD && !process.env.FACTORIO_RCON_PASSWORD_FILE) {
     try { connection = await sessionConnection(); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
-  let password = connection ? undefined : process.env.FACTORIO_RCON_PASSWORD;
-  const passwordFile = connection?.passwordFile ?? process.env.FACTORIO_RCON_PASSWORD_FILE;
-  if (!password && passwordFile) password = (await readFile(passwordFile,'utf8')).trimEnd();
-  if (!password) throw new Error('Run fh start, select --session NAME, or set FACTORIO_RCON_PASSWORD_FILE');
-  const client = new RconClient({host:connection?.host ?? values.host ?? process.env.FACTORIO_RCON_HOST, port:connection?.port ?? integer(values.port ?? process.env.FACTORIO_RCON_PORT,27015), password, timeoutMs:integer(values.timeout,5000)});
-  const harness = new Harness(client, integer(values.player,connection?.player ?? 1), values.journal);
+  // Compiling and validating a large bundle in-game can take longer than a gameplay reply.
+  const deploying = command === 'deploy' || command === 'watch';
+  let harness: Pick<Harness,'request'>;
+  let deployer: Harness | undefined;
+  let client: {close(): void};
+  const bridged = connection?.kind === 'bridge';
+  if (connection?.kind === 'bridge') {
+    if (deploying || command === 'view') throw new Error(`${command} needs the agent-harness mod on the server; bridge sessions act through normal player input only`);
+    if (values.player) throw new Error('A bridge controls its own client\'s player; --player does not apply');
+    // Bridge replies wait for the next game tick; allow for a busy client.
+    const bridge = new BridgeClient(connection.socket, integer(values.timeout,10000), values.journal);
+    harness = bridge; client = bridge;
+  } else {
+    let password = connection ? undefined : process.env.FACTORIO_RCON_PASSWORD;
+    const passwordFile = connection?.passwordFile ?? process.env.FACTORIO_RCON_PASSWORD_FILE;
+    if (!password && passwordFile) password = (await readFile(passwordFile,'utf8')).trimEnd();
+    if (!password) throw new Error('Run fh start, select --session NAME, or set FACTORIO_RCON_PASSWORD_FILE');
+    const rcon = new RconClient({host:connection?.host ?? values.host ?? process.env.FACTORIO_RCON_HOST, port:connection?.port ?? integer(values.port ?? process.env.FACTORIO_RCON_PORT,27015), password, timeoutMs:integer(values.timeout,deploying ? 60000 : 5000)});
+    harness = deployer = new Harness(rcon, integer(values.player,connection?.player ?? 1), values.journal);
+    client = rcon;
+  }
   let stopping = false;
   const stop = () => { stopping = true; client.close(); };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
+  async function waitForBridgeAction(action: string): Promise<Reply> {
+    const deadline = Date.now()+integer(values['wait-timeout'],30000);
+    while (!stopping && Date.now()<deadline) {
+      // status is observe without the entity scan.
+      const status = await harness.request('status');
+      if (!status.ok) return status;
+      if (!status.result?.controls?.[action]) {
+        const last = status.result?.last?.[action];
+        if (last?.outcome && !['duration_elapsed','target_mined','built'].includes(last.outcome)) {
+          return {...status,ok:false,error:{code:'action_interrupted',message:`Control ended: ${last.outcome}`}};
+        }
+        return status;
+      }
+      await delay(100);
+    }
+    if (stopping) throw new Error('Stopped waiting for action; inspect observe. Game actions have a bounded tick duration.');
+    const status = await harness.request('status');
+    return {...status, ok:false, error:{code:'wait_timeout', message:`${action} still running after the wait timeout; it continues in game: poll status or wait again (--wait-timeout MS)`}};
+  }
   async function waitForAction(action: string): Promise<Reply> {
+    if (bridged) return waitForBridgeAction(action);
     const deadline = Date.now()+integer(values['wait-timeout'],30000);
     while (!stopping && Date.now()<deadline) {
       const status = await harness.request('status');
       const active = action === 'shoot' ? status.result?.combat : status.result?.active;
       // active may report shooting when movement has already finished.
-      const stillRunning = active && (action === 'shoot' || active.kind === action);
+      const stillRunning = active && (action === 'shoot' || active.kind === (['collect','rearm','refuel'].includes(action) ? 'gather' : action));
       if (!status.ok || !stillRunning) {
         const last = action === 'shoot' ? status.result?.last_combat : status.result?.last;
-        const success = ['duration_elapsed','target_mined','repair_completed','arrived'];
+        const success = ['duration_elapsed','target_mined','repair_completed','arrived','path_built','collected','topped_up','nothing_to_do','constructed'];
         if (status.ok && last?.outcome && !success.includes(last.outcome)) {
           return {...status,ok:false,error:{code:'action_interrupted',message:`Control ended: ${last.outcome}`}};
         }
@@ -150,19 +200,25 @@ async function main() {
       }
       await delay(100);
     }
-    throw new Error('Stopped waiting for action; inspect status. Game actions have a bounded tick duration.');
+    if (stopping) throw new Error('Stopped waiting for action; inspect status. Game actions have a bounded tick duration.');
+    // Still running is not a failure of the action: report where it stands.
+    const status = await harness.request('status');
+    return {...status, ok:false, error:{code:'wait_timeout', message:`${action} still running after the wait timeout; it continues in game: poll status or wait again (--wait-timeout MS)`}};
   }
-  async function execute(action: string, args: Record<string,unknown>, id?: string, wait = false): Promise<Reply> {
+  async function execute(action: string, args: Record<string,unknown>, id?: string, wait = false, onAccepted?: (reply: Reply) => void): Promise<Reply> {
     const requestId = id ?? randomUUID();
     let reply: Reply;
     try { reply = await harness.request(action,args,requestId); }
     catch (error) {
-      if (error instanceof RconOutcomeUnknown) {
+      if (error instanceof RconOutcomeUnknown || error instanceof BridgeOutcomeUnknown) {
         return {id:requestId, ok:false, error:{code:'outcome_unknown', message:error.message, recovery:'Inspect status/state. Retry only the same action, args, player and ID while the dedup cache retains it.'}};
       }
       throw error;
     }
-    if (wait && reply.ok && ['walk','move_to','mine','shoot','pickup','repair'].includes(action)) {
+    const waits = bridged ? ['walk','mine','build'].includes(action)
+      : ['walk','move_to','build_path','construct','mine','shoot','pickup','repair'].includes(action) || (['collect','rearm','refuel'].includes(action) && args.radius !== undefined);
+    if (wait && reply.ok && waits) {
+      onAccepted?.(reply);
       const completion = await waitForAction(action);
       return {...reply, ok:completion.ok, result:{accepted:reply.result, completion:completion.result}, ...(completion.ok ? {} : {error:completion.error})};
     }
@@ -178,7 +234,7 @@ async function main() {
           const source = await bundleRuntime(path);
           const hash = createHash('sha256').update(source).digest('hex');
           if (hash !== previous) {
-            const reply = await harness.deploy(source);
+            const reply = await deployer!.deploy(source);
             output({...reply, source_sha256:hash});
             // Reject invalid edits once; retry connection failures on the next pass.
             previous = hash;
@@ -227,6 +283,13 @@ async function main() {
         await writeFile(path,renderMap(reply.result,Number(args.radius ?? 24)));
         output({ok:true,tick:reply.tick,result:{path,kind:'local-schematic',legend:'white=player, blue=iron/water, orange=copper, dark=coal, green=trees/uranium, red=enemies, tan=structures',position:reply.result.player?.position,entities:Object.keys(reply.result.entities ?? {}).length,tiles:Object.keys(reply.result.tiles ?? {}).length,truncated:reply.result.truncated ?? false,tiles_truncated:reply.result.tiles_truncated ?? false}});
       } else {output(reply);process.exitCode=1;}
+    } else if (command === 'doctor' && bridged) {
+      const bridge = await execute('bridge_status',{});
+      const player = bridge.ok && bridge.result?.in_game ? await execute('observe',{}) : undefined;
+      const ready = bridge.ok && player?.ok === true && player.result?.player?.character === true;
+      output({ok:ready,result:{bridge:bridge.result,player:player?.result?.player},
+        ...(ready ? {} : {error:bridge.error ?? player?.error ?? {code:'player_not_ready',message:bridge.result?.in_game ? 'The player has no character (dead, spectating, or in a cutscene)' : 'The client is not in a multiplayer game'}})});
+      if (!ready) process.exitCode=1;
     } else if (command === 'doctor') {
       const runtime = await execute('describe',{});
       const player = runtime.ok ? await execute('status',{}) : undefined;
@@ -238,7 +301,10 @@ async function main() {
     } else {
       const action = command === 'call' ? positionals[1] : command;
       if (!action) throw new Error('call requires an action; use fh describe');
-      const reply = await execute(action,args,values.id,values.wait);
+      // A long wait shows its acceptance first, so an interrupted client still
+      // saw what the game took on (compact output only; JSON stays one reply).
+      const reply = await execute(action,args,values.id,values.wait,
+        outputFormat === 'compact' ? accepted => output({...accepted, waiting:`until completion (poll status if interrupted)`}) : undefined);
       if (reply.ok && action === 'blueprint_export' && !args.layout && values.out) {
         await mkdir(dirname(resolve(values.out)),{recursive:true});
         await writeFile(values.out,reply.result.blueprint+'\n');
@@ -252,6 +318,6 @@ async function main() {
   }
 }
 main().catch(error => {
-  output({ok:false,error:{code:error instanceof RconOutcomeUnknown ? 'outcome_unknown' : 'client_error',message:error instanceof Error ? error.message : String(error)}});
+  output({ok:false,error:{code:error instanceof RconOutcomeUnknown || error instanceof BridgeOutcomeUnknown ? 'outcome_unknown' : 'client_error',message:error instanceof Error ? error.message : String(error)}});
   process.exitCode=1;
 });
