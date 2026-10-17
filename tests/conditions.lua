@@ -6,6 +6,7 @@ local mine={name='player',technologies={turrets={researched=true}}}
 local worm={valid=true,type='turret',position={x=10,y=0},fogged=false}
 local nest={valid=true,type='unit-spawner',position={x=20,y=0},fogged=true}
 local biter={valid=true,type='unit',position={x=5,y=0},hidden=true}
+local foes={worm,nest,biter}
 local function turret(ammo,target)
   return {valid=true,type='ammo-turret',position={x=0,y=0},shooting_target=target,
     get_inventory=function() return {get_item_count=function() return ammo end} end}
@@ -14,7 +15,7 @@ local ours={turret(20),turret(3,worm)}
 local surface={find_entities_filtered=function(f)
   if f.force=='enemy' then
     local out={}
-    for _,e in ipairs({worm,nest,biter}) do
+    for _,e in ipairs(foes) do
       for _,t in ipairs(f.type) do if t==e.type then out[#out+1]=e end end
     end
     return out
@@ -31,6 +32,11 @@ local function check(c) C.validate(c); return C.check(p,c) end
 local met,saw=check({['until']='no_enemy_structures',radius=30})
 eq(met,false); eq(saw,'2 enemy structures')
 eq(select(2,check({['until']='no_enemies'})),'2 enemies')
+-- Space Age's pentapods (spider-unit) and demolishers (segmented-unit) count too.
+foes[#foes+1]={valid=true,type='spider-unit',position={x=8,y=0}}
+foes[#foes+1]={valid=true,type='segmented-unit',position={x=0,y=12}}
+eq(select(2,check({['until']='no_enemies'})),'4 enemies')
+table.remove(foes); table.remove(foes)
 eq(check({['until']='turrets_idle'}),false)
 ours[2].shooting_target=nil; eq(check({['until']='turrets_idle'}),true)
 met,saw=check({['until']='ammo_below',count=5}); eq(met,true); eq(saw,'1 turrets below 5')

@@ -3207,7 +3207,7 @@ function M.tick(event)
           local best=action.radius+1
           cached={next_scan=event.tick+6}
           if #enemies>0 then
-            for _,e in pairs(p.surface.find_entities_filtered{position=p.position,radius=action.radius,force=enemies,limit=256,type={'unit','unit-spawner','turret','ammo-turret','electric-turret','character'}}) do
+            for _,e in pairs(p.surface.find_entities_filtered{position=p.position,radius=action.radius,force=enemies,limit=256,type={'unit','spider-unit','segmented-unit','unit-spawner','turret','ammo-turret','electric-turret','character'}}) do
               local d=distance(p.position,e.position)
               if e.valid and visible(p,e.position) and d<best then best=d; cached.entity=e end
             end

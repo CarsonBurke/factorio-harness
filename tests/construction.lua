@@ -219,4 +219,15 @@ eq(run_timed(awaiting),'constructed');eq(awaiting.built,1)
 -- With nothing crafting, the same ghost is missing.
 ghosts={ghost(230.5,'boiler')};p.position={x=230.5,y=6.5}
 local short=C.plan_ghosts(p,{},{});eq(run_timed(short),'incomplete');eq(short.missing.boiler,1)
+-- The walk's target is built by someone else and its stand point covers no
+-- other ghost: the walk is dropped, not kept with a nil target.
+inventory.boiler=0;inventory['stone-furnace']=1;crafting=1
+ghosts={ghost(240.5,'boiler'),ghost(260.5,'stone-furnace')};p.position={x=240.5,y=6.5}
+local lost=C.plan_ghosts(p,{},{})
+eq(C.tick_ghosts(p,lost),nil);eq(lost.nav.target.ghost,ghosts[2])
+ghosts[2].valid=false
+for _=1,3 do eq(C.tick_ghosts(p,lost),nil);game.tick=game.tick+1 end
+eq(lost.awaiting_craft,true);eq(lost.gone,1)
+crafting=0;inventory.boiler=1
+eq(run_timed(lost),'constructed');eq(lost.built,1)
 print('continuous construction tests passed')
