@@ -309,7 +309,8 @@ return function(api)
       for _,rec in ipairs(action.pending) do
         if rec.ghost.valid and api.distance(nav.position,rec.ghost.position)<=reach(p,rec)-(rec.mine and 0 or 1) then covered=rec; break end
       end
-      nav.target=covered; nav=covered and nav
+      -- None covered: drop the walk, or the next tick indexes a nil target.
+      if covered then nav.target=covered else action.nav=nil; nav=nil end
     end
     if nav then
       local outcome=api.navigate(p,nav)
