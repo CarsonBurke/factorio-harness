@@ -537,6 +537,14 @@ runtime=dofile('mod/agent-harness_0.1.0/runtime.lua') -- simulate saved source r
 advance(3); eq(scans,1); eq(p.shooting_state.state,1)
 advance(6); eq(scans,2); eq(p.shooting_state.state,1)
 advance(1); eq(p.shooting_state.state,0)
+-- Space Age's pentapods (spider-unit) and demolishers (segmented-unit) are targets too.
+p.surface.find_entities_filtered=function(filter)
+  for _,t in ipairs(filter.type) do if t=='segmented-unit' then return {{valid=true,type=t,position={x=2,y=0},force=enemy}} end end
+  return {}
+end
+call('shoot',{auto=true,ticks=12})
+advance(1); eq(p.shooting_state.state,1)
+advance(12); eq(p.shooting_state.state,0)
 -- One observation exposes small queue/combat summaries without queue history.
 p.surface.find_entities_filtered=function() return {} end
 main.get_contents=function() return {} end
@@ -859,6 +867,16 @@ eq(kited.kind,'kite'); eq(kited.outcome,'clear'); eq(kited.kills,1); eq(kited.am
 foes={{valid=true,type='unit',name='small-biter',position={x=3,y=0},force=enemy_force}}
 call('kite',{}); p.character.health=90; advance(1)
 eq(call('status').last.outcome,'low_health')
+p.character.health=250
+foes={{valid=true,type='spider-unit',name='small-strafer-pentapod',position={x=5,y=0},force=enemy_force}}
+p.surface.find_entities_filtered=function(f)
+  local out={}
+  for _,e in ipairs(foes) do for _,t in ipairs(type(f.type)=='table' and f.type or {f.type}) do if e.valid and e.type==t then out[#out+1]=e end end end
+  return out
+end
+call('kite',{}); advance(1)
+eq(p.walking_state.walking,true); eq(p.walking_state.direction,12); eq(p.shooting_state.position,foes[1].position)
+foes[1].valid=false; advance(1); eq(call('status').last.outcome,'clear')
 magazines=0; fails(function() call('kite',{}) end,'no ammunition')
 -- Poles: a placed pole wires into every other network in reach; wire joins
 -- or splits two reachable poles; power summarises networks in an area.
